@@ -185,10 +185,9 @@ Write-Host ""
 Write-Host "   [-] Fuehre erweiterte Forensik-Checks durch..." -ForegroundColor Yellow
 
 # Check: USB-Geraete (fuer externe DMA-Verbindungen via USB-zu-PCIe-Adapter)
-$usbDevices = Get-CimInstance Win32_USBControllerDevice | ForEach-Object {
-    $dep = [wmi]$_.Dependent
-    $dep.Name
-}
+$usbDevices = Get-CimInstance Win32_PnPEntity |
+    Where-Object { $_.DeviceID -match "^USB\\" } |
+    Select-Object -ExpandProperty Name
 
 # Check: Unbekannte/generische Netzwerkkarten (Spoofing-Indiz)
 $genericNics = Get-CimInstance Win32_NetworkAdapter |
