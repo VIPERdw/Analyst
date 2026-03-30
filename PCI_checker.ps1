@@ -185,6 +185,7 @@ Write-Host ""
 Write-Host "   [-] Fuehre erweiterte Forensik-Checks durch..." -ForegroundColor Yellow
 
 # Check: USB-Geraete (fuer externe DMA-Verbindungen via USB-zu-PCIe-Adapter)
+# Hinweis: [wmi]-Cast ist inkompatibel mit CimInstance – korrekter Weg ueber Win32_PnPEntity
 $usbDevices = Get-CimInstance Win32_PnPEntity |
     Where-Object { $_.DeviceID -match "^USB\\" } |
     Select-Object -ExpandProperty Name
@@ -306,8 +307,29 @@ Write-Host "   =================================================================
 $saveChoice = Read-Host "   [>] Scan-Ergebnis als TXT speichern? (J/N)"
 
 if ($saveChoice -match "^[JjYy]") {
-    $scriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Definition
-    if ([string]::IsNullOrWhiteSpace($scriptDir)) { $scriptDir = $PWD.Path }
+    # Robuste Pfad-Ermittlung: PSScriptRoot ist leer bei iex/irm-Ausfuehrung,
+    # und MyCommand.Definition enthaelt dann den Aufruf-String statt einem Pfad.
+    $scriptDir = $null
+    if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+        $scriptDir = $PSScriptRoot
+    } else {
+        $rawDef = $MyInvocation.MyCommand.Definition
+        if (-not [string]::IsNullOrWhiteSpace($rawDef)) {
+            try {
+                $candidate = Split-Path -Parent $rawDef -ErrorAction Stop
+                if ($candidate -and (Test-Path $candidate -IsValid -ErrorAction SilentlyContinue) -and (Test-Path $candidate -ErrorAction SilentlyContinue)) {
+                    $scriptDir = $candidate
+                }
+            } catch {}
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($scriptDir)) {
+        $scriptDir = [Environment]::GetFolderPath("Desktop")
+    }
+    if ([string]::IsNullOrWhiteSpace($scriptDir) -or -not (Test-Path $scriptDir -ErrorAction SilentlyContinue)) {
+        $scriptDir = $env:TEMP
+    }
+
     $timeStamp  = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
     $outputFile = Join-Path $scriptDir "Scan_Ergebnis_$timeStamp.txt"
 
