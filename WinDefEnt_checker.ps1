@@ -249,40 +249,39 @@ function Get-DefenderEvents {
                 }
 
                 # ── Konfiguration / Exclusions ─────────────────────────────
+                # Nur Exclusion-Änderungen anzeigen – interne Windows-Konfig-
+                # Änderungen (Diagnostics, Definitions, Updates, Signatures usw.)
+                # werden komplett ignoriert, da sie keinen Informationswert haben.
                 5007 {
                     $newVal = Get-XmlData -Xml $eventXml -FieldName 'New Value'
                     $oldVal = Get-XmlData -Xml $eventXml -FieldName 'Old Value'
 
-                    # Exclusion-Pfade, Prozesse und Extensions erkennen
+                    # Nur Events mit Exclusions-Bezug weiterverarbeiten
+                    $isExclusionEvent = ($newVal -match 'Exclusions\\' -or $oldVal -match 'Exclusions\\')
+                    if (-not $isExclusionEvent) { continue }
+
                     $patterns = @{
                         'Path'      = 'Exclusions\\Paths\\(.+?)(?:\s*=|$)'
                         'Process'   = 'Exclusions\\Processes\\(.+?)(?:\s*=|$)'
                         'Extension' = 'Exclusions\\Extensions\\(.+?)(?:\s*=|$)'
                     }
 
-                    $parsedNew = $null; $parsedOld = $null; $exType = "Konfiguration"
+                    $parsedNew = $null; $parsedOld = $null; $exType = "Exclusion"
 
                     foreach ($pkey in $patterns.Keys) {
                         if ($newVal -match $patterns[$pkey]) { $parsedNew = $matches[1].Trim(); $exType = "Exclusion $pkey" }
                         if ($oldVal -match $patterns[$pkey]) { $parsedOld = $matches[1].Trim(); $exType = "Exclusion $pkey" }
                     }
 
-                    if ($parsedNew -or $parsedOld) {
-                        $msg = if ($parsedNew -and -not $parsedOld)  { "HINZUGEFÜGT: $parsedNew" }
-                               elseif ($parsedOld -and -not $parsedNew) { "ENTFERNT: $parsedOld" }
-                               else { "GEÄNDERT: $parsedOld → $parsedNew" }
+                    $value    = if ($parsedNew) { $parsedNew } else { $parsedOld }
+                    $changeOp = if ($parsedNew -and -not $parsedOld)     { "HINZUGEFÜGT" }
+                                elseif ($parsedOld -and -not $parsedNew) { "ENTFERNT" }
+                                else                                      { "GEÄNDERT" }
 
-                        $checkText = "$parsedNew $parsedOld"
-                        $isFlagged = Test-CheatMatch -Text $checkText
-                        if ($isFlagged) { $flagCount++ }
-                        Write-Row -Time $timestamp -EventID $id -Type $exType -Message $msg -Color Red -Flagged:$isFlagged
-                    }
-                    else {
-                        # Generische Konfig-Änderung anzeigen (raw, gekürzt)
-                        $rawMsg = if ($newVal) { $newVal } elseif ($oldVal) { $oldVal } else { "Unbekannte Änderung" }
-                        if ($rawMsg.Length -gt 80) { $rawMsg = $rawMsg.Substring(0,77) + "..." }
-                        Write-Row -Time $timestamp -EventID $id -Type "Konfig-Änderung" -Message $rawMsg -Color DarkYellow
-                    }
+                    $msg = "${changeOp}: $value"
+                    $isFlagged = Test-CheatMatch -Text "$parsedNew $parsedOld"
+                    if ($isFlagged) { $flagCount++ }
+                    Write-Row -Time $timestamp -EventID $id -Type $exType -Message $msg -Color Red -Flagged:$isFlagged
                 }
 
                 # ── Threat-Erkennung ───────────────────────────────────────
@@ -363,19 +362,60 @@ function Get-DefenderEvents {
                     $flagCount++
                 }
 
-                # ── Verlauf gelöscht (1013) – Hinweis auf Verschleierung ──
+                # ── Verlauf gelöscht (1013) ────────────────────────────────
+                # Nicht nur anzeigen – direkt herausfinden was im Zeitfenster
+                # davor/danach erkannt wurde, um den gelöschten Eintrag zu rekonstruieren.
                 1013 {
-                    Write-Row -Time $timestamp -EventID $id -Type "VERLAUF GELÖSCHT" -Message "Schutzverlauf-Eintrag wurde manuell entfernt!" -Color Yellow -Flagged
                     $flagCount++
+                    Write-Host ""
+                    Write-Host ("  " + "─" * 76) -ForegroundColor DarkRed
+                    Write-Host ("  [!!!] $timestamp  [1013]  SCHUTZVERLAUF-EINTRAG GELÖSCHT") -ForegroundColor Red
+                    Write-Host ("        Jemand hat einen Eintrag aus dem Schutzverlauf entfernt.") -ForegroundColor DarkYellow
+                    Write-Host ("        Suche nach Threats im Zeitfenster ±5 Minuten...") -ForegroundColor DarkYellow
+
+                    # Zeitfenster um den Lösch-Event
+                    $tMin = $event.TimeCreated.AddMinutes(-5)
+                    $tMax = $event.TimeCreated.AddMinutes(5)
+
+                    # Aus den bereits geladenen Events filtern (kein neuer API-Call nötig)
+                    $nearby = $events | Where-Object {
+                        $_.TimeCreated -ge $tMin -and $_.TimeCreated -le $tMax -and
+                        $_.Id -in @(1006,1007,1008,1009,1015,1116,1117,1118,1119)
+                    }
+
+                    if ($nearby) {
+                        Write-Host ("        Gefundene Threat-Events in diesem Zeitfenster:") -ForegroundColor Cyan
+                        foreach ($nb in $nearby | Sort-Object TimeCreated) {
+                            try {
+                                $nbXml      = [xml]$nb.ToXml()
+                                $nbTime     = $nb.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')
+                                $nbThreat   = Get-XmlData -Xml $nbXml -FieldName 'Threat Name'
+                                $nbPath     = Extract-ThreatPath -RawPath (Get-XmlData -Xml $nbXml -FieldName 'Path')
+                                $nbAction   = Get-XmlData -Xml $nbXml -FieldName 'Action Name'
+                                $nbSeverity = Get-XmlData -Xml $nbXml -FieldName 'Severity Name'
+
+                                $detail = "  ID=$($nb.Id)"
+                                if ($nbThreat)   { $detail += " | $nbThreat" }
+                                if ($nbSeverity) { $detail += " [$nbSeverity]" }
+                                if ($nbAction)   { $detail += " → $nbAction" }
+                                if ($nbPath)     { $detail += " | $nbPath" }
+
+                                $isSusp = Test-CheatMatch -Text "$nbThreat $nbPath"
+                                $col    = if ($isSusp) { 'Yellow' } else { 'Gray' }
+                                Write-Host ("          $nbTime $detail") -ForegroundColor $col
+                                if ($isSusp) { Write-Host ("          >>> CHEAT-KEYWORD MATCH <<<") -ForegroundColor Yellow }
+                            } catch {}
+                        }
+                    }
+                    else {
+                        Write-Host ("        Keine direkten Threat-Events im Zeitfenster gefunden.") -ForegroundColor DarkGray
+                        Write-Host ("        Der Eintrag wurde möglicherweise gezielt entfernt bevor er sichtbar war.") -ForegroundColor DarkGray
+                    }
+                    Write-Host ("  " + "─" * 76) -ForegroundColor DarkRed
+                    Write-Host ""
                 }
 
-                # ── Fallback: alle anderen geladenen Events ────────────────
-                default {
-                    $msg = $event.Message
-                    if ($msg -and $msg.Length -gt 100) { $msg = $msg.Substring(0,97) + "..." }
-                    if (-not $msg) { $msg = "(Kein Nachrichtentext)" }
-                    Write-Row -Time $timestamp -EventID $id -Type "Sonstig" -Message $msg -Color DarkGray
-                }
+                # Alle anderen Event-IDs werden bewusst ignoriert (kein Informationswert)
             }
         }
         catch {
