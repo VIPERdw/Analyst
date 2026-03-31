@@ -149,17 +149,65 @@ function Get-ExecutiveSummary {
     param([System.Diagnostics.Eventing.Reader.EventLogRecord[]]$Events)
 
     $summary = [PSCustomObject]@{
-        LogsCleared        = $false
-        LogClearCount      = 0
-        ActiveExclusions   = 0
-        SuspExclusions     = 0
-        DisableEvents24h   = 0
-        FlaggedFinds       = 0
-        QuarantineRestores = 0
-        Disable2003Count   = 0
+        LogsCleared           = $false
+        LogClearCount         = 0
+        ActiveExclusions      = 0
+        SuspExclusions        = 0
+        DisableEvents24h      = 0
+        FlaggedFinds          = 0
+        QuarantineRestores    = 0
+        Disable2003Count      = 0
+        # AV & Echtzeitschutz-Status
+        InstalledAVProducts   = @()        # Liste aller SecurityCenter2-AV-Produkte
+        ThirdPartyAVFound     = $false     # true wenn Nicht-Defender-AV registriert
+        RealTimeProtection    = 'Unbekannt' # 'Aktiv', 'Deaktiviert', 'Unbekannt'
     }
 
-    # Log gelöscht?
+    # ── Aktuellen Echtzeit-Schutz-Status ermitteln (MpPreference) ──────────────
+    # Primär: Get-MpComputerStatus (liefert RealTimeProtectionEnabled direkt)
+    try {
+        $mpStatus = Get-MpComputerStatus -ErrorAction Stop
+        $summary.RealTimeProtection = if ($mpStatus.RealTimeProtectionEnabled) { 'Aktiv' } else { 'Deaktiviert' }
+    }
+    catch {
+        # Fallback: letztes 2003/5004-Event auswerten
+        try {
+            $lastProtEvt = $Events | Where-Object { $_.Id -in @(2003, 5004) } |
+                           Sort-Object TimeCreated | Select-Object -Last 1
+            if ($lastProtEvt) {
+                $summary.RealTimeProtection = if ($lastProtEvt.Id -eq 2003) { 'Deaktiviert (lt. letztem Event)' } else { 'Unbekannt (kein direkter Status)' }
+            }
+        } catch {}
+    }
+
+    # ── Installierte Antiviren-Programme (SecurityCenter2 via WMI/CIM) ─────────
+    try {
+        $avProducts = Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName 'AntivirusProduct' -ErrorAction Stop
+        foreach ($av in $avProducts) {
+            $summary.InstalledAVProducts += $av.displayName
+            # Alles außer Windows Defender / Security Center selbst gilt als Drittanbieter
+            if ($av.displayName -notmatch 'Windows Defender|Microsoft Defender|Windows Security') {
+                $summary.ThirdPartyAVFound = $true
+            }
+        }
+    }
+    catch {
+        # CIM nicht verfügbar → WMI-Fallback
+        try {
+            $avProducts = Get-WmiObject -Namespace 'root/SecurityCenter2' -Class 'AntivirusProduct' -ErrorAction Stop
+            foreach ($av in $avProducts) {
+                $summary.InstalledAVProducts += $av.displayName
+                if ($av.displayName -notmatch 'Windows Defender|Microsoft Defender|Windows Security') {
+                    $summary.ThirdPartyAVFound = $true
+                }
+            }
+        }
+        catch {
+            $summary.InstalledAVProducts += '(WMI-Zugriff verweigert oder nicht verfügbar)'
+        }
+    }
+
+    # ── Log gelöscht? ──────────────────────────────────────────────────────────
     try {
         $clearEvts = Get-WinEvent -FilterHashtable @{LogName='System'; Id=104} -ErrorAction Stop
         if ($clearEvts) {
@@ -217,41 +265,96 @@ function Show-ExecutiveSummary {
     Write-Host ("█" * 80) -ForegroundColor DarkCyan
     Write-Host ""
     Write-Host "  ██  EXECUTIVE SUMMARY – SCHNELLÜBERSICHT  ██" -ForegroundColor Cyan
+    Write-Host "  ██  Analysezeitpunkt: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  ██" -ForegroundColor DarkCyan
     Write-Host ""
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # BLOCK 1 – AKTUELLER ECHTZEIT-SCHUTZ-STATUS (zum Ausführungszeitpunkt)
+    # ══════════════════════════════════════════════════════════════════════════
+    Write-Host ("  ┌─ ECHTZEIT-SCHUTZ (JETZT) " + "─" * 52 + "┐") -ForegroundColor DarkCyan
+    switch -Wildcard ($Summary.RealTimeProtection) {
+        'Aktiv' {
+            Write-Host ("  │  ✓  Echtzeitschutz aktuell  : AKTIV") -ForegroundColor Green
+        }
+        'Deaktiviert*' {
+            Write-Host ("  │  ✗  Echtzeitschutz aktuell  : DEAKTIVIERT  ◄── ACHTUNG!") -ForegroundColor Red
+        }
+        default {
+            Write-Host ("  │  ?  Echtzeitschutz aktuell  : $($Summary.RealTimeProtection)") -ForegroundColor DarkYellow
+        }
+    }
+
+    # ── Installierte AV-Software ──────────────────────────────────────────────
+    if ($Summary.InstalledAVProducts.Count -gt 0) {
+        $avLine = $Summary.InstalledAVProducts -join ', '
+        Write-Host ("  │  AV-Software erkannt        : $avLine") -ForegroundColor Cyan
+    } else {
+        Write-Host ("  │  AV-Software erkannt        : Keine / nicht abfragbar") -ForegroundColor DarkGray
+    }
+
+    # ── Drittanbieter-AV-Hinweis ─────────────────────────────────────────────
+    if ($Summary.ThirdPartyAVFound) {
+        $thirdPartyNames = ($Summary.InstalledAVProducts |
+            Where-Object { $_ -notmatch 'Windows Defender|Microsoft Defender|Windows Security' }) -join ', '
+        Write-Host ("  │") -ForegroundColor DarkYellow
+        Write-Host ("  │  ⚠  DRITTANBIETER-AV AKTIV: $thirdPartyNames") -ForegroundColor Yellow
+        Write-Host ("  │     Hinweis: Wenn ein Drittanbieter-AV installiert ist, deaktiviert") -ForegroundColor DarkYellow
+        Write-Host ("  │     Windows automatisch den Defender-Echtzeitschutz. Ein deaktivierter") -ForegroundColor DarkYellow
+        Write-Host ("  │     Defender ist in diesem Fall NORMAL und kein Cheat-Indikator.") -ForegroundColor DarkYellow
+        Write-Host ("  │     Die Defender-Log-Auswertung ist hier möglicherweise nicht") -ForegroundColor DarkYellow
+        Write-Host ("  │     aussagekräftig – Deaktivierungs-Events bitte ignorieren.") -ForegroundColor DarkYellow
+    }
+    Write-Host ("  └" + "─" * 78 + "┘") -ForegroundColor DarkCyan
+    Write-Host ""
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # BLOCK 2 – LOG-ANALYSE KENNZAHLEN
+    # ══════════════════════════════════════════════════════════════════════════
+    Write-Host ("  ┌─ LOG-ANALYSE " + "─" * 64 + "┐") -ForegroundColor DarkMagenta
 
     # ── Log gelöscht? ──
     if ($Summary.LogsCleared) {
-        Write-Host ("  [!!!]  LOGS GELÖSCHT          : JA – $($Summary.LogClearCount)x geleert!") -ForegroundColor Red
+        Write-Host ("  │  [!!!]  Logs gelöscht         : JA – $($Summary.LogClearCount)x geleert!") -ForegroundColor Red
     } else {
-        Write-Host ("  [ OK ]  Logs gelöscht          : Nein") -ForegroundColor Green
+        Write-Host ("  │  [ OK ]  Logs gelöscht        : Nein") -ForegroundColor Green
     }
 
     # ── Aktive Exclusions ──
-    $excColor = if ($Summary.ActiveExclusions -gt 0) { 'Yellow' } else { 'Green' }
+    $excColor = if ($Summary.SuspExclusions -gt 0) { 'Yellow' } elseif ($Summary.ActiveExclusions -gt 0) { 'White' } else { 'Green' }
     $excSusp  = if ($Summary.SuspExclusions -gt 0) { "  ← $($Summary.SuspExclusions) VERDÄCHTIG!" } else { "" }
-    Write-Host ("  [INF]  Aktive Exclusions       : $($Summary.ActiveExclusions)$excSusp") -ForegroundColor $excColor
+    Write-Host ("  │  [INF]  Aktive Exclusions     : $($Summary.ActiveExclusions)$excSusp") -ForegroundColor $excColor
 
     # ── Deaktivierungen ──
-    $disColor = if ($Summary.DisableEvents24h -gt 0) { 'Red' } else { 'Green' }
-    Write-Host ("  [INF]  Schutz-Deaktiv. (24h)   : $($Summary.DisableEvents24h)x (davon $($Summary.Disable2003Count)x Echtzeit AUS)") -ForegroundColor $disColor
+    # Wenn Drittanbieter-AV gefunden → Deaktivierungen als normales Verhalten markieren
+    if ($Summary.ThirdPartyAVFound -and $Summary.DisableEvents24h -gt 0) {
+        Write-Host ("  │  [INF]  Schutz-Deaktiv. (24h) : $($Summary.DisableEvents24h)x  (wahrscheinlich durch Drittanbieter-AV)") -ForegroundColor DarkGray
+    } else {
+        $disColor = if ($Summary.DisableEvents24h -gt 0) { 'Red' } else { 'Green' }
+        Write-Host ("  │  [INF]  Schutz-Deaktiv. (24h) : $($Summary.DisableEvents24h)x (davon $($Summary.Disable2003Count)x Echtzeit AUS)") -ForegroundColor $disColor
+    }
 
     # ── Geflaggte Funde ──
     $findColor = if ($Summary.FlaggedFinds -gt 0) { 'Yellow' } else { 'Green' }
-    Write-Host ("  [INF]  Geflaggte Cheat-Funde   : $($Summary.FlaggedFinds)") -ForegroundColor $findColor
+    Write-Host ("  │  [INF]  Geflaggte Cheat-Funde : $($Summary.FlaggedFinds)") -ForegroundColor $findColor
 
     # ── Quarantäne-Restores ──
     $qColor = if ($Summary.QuarantineRestores -gt 0) { 'Red' } else { 'Green' }
-    Write-Host ("  [INF]  Quarantäne-Restores     : $($Summary.QuarantineRestores)") -ForegroundColor $qColor
+    Write-Host ("  │  [INF]  Quarantäne-Restores   : $($Summary.QuarantineRestores)") -ForegroundColor $qColor
 
+    Write-Host ("  └" + "─" * 78 + "┘") -ForegroundColor DarkMagenta
     Write-Host ""
 
-    # ── Gesamtbewertung ──
+    # ══════════════════════════════════════════════════════════════════════════
+    # BLOCK 3 – GESAMTBEWERTUNG
+    # Wenn Drittanbieter-AV vorhanden: Deaktivierungen fließen NICHT in Risiko ein
+    # ══════════════════════════════════════════════════════════════════════════
     $risk = 0
     if ($Summary.LogsCleared)              { $risk += 3 }
-    if ($Summary.DisableEvents24h -gt 0)   { $risk += 3 }
     if ($Summary.FlaggedFinds -gt 0)       { $risk += 2 }
     if ($Summary.SuspExclusions -gt 0)     { $risk += 2 }
     if ($Summary.QuarantineRestores -gt 0) { $risk += 2 }
+    # Deaktivierungen nur werten wenn KEIN Drittanbieter-AV vorhanden
+    if (-not $Summary.ThirdPartyAVFound -and $Summary.DisableEvents24h -gt 0) { $risk += 3 }
 
     if ($risk -ge 5) {
         Write-Host ("  ┌─────────────────────────────────────────────────────────────────────────┐") -ForegroundColor Red
@@ -265,6 +368,10 @@ function Show-ExecutiveSummary {
         Write-Host ("  ┌──────────────────────────────────────────────────────────────────────────┐") -ForegroundColor Green
         Write-Host ("  │  ✓  RISIKO-BEWERTUNG: NIEDRIG – Keine offensichtlichen Anomalien.        │") -ForegroundColor Green
         Write-Host ("  └──────────────────────────────────────────────────────────────────────────┘") -ForegroundColor Green
+    }
+
+    if ($Summary.ThirdPartyAVFound) {
+        Write-Host ("        ↳ Drittanbieter-AV erkannt: Deaktivierungen wurden aus Risiko-Score HERAUSGERECHNET.") -ForegroundColor DarkGray
     }
 
     Write-Host ""
