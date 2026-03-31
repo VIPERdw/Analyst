@@ -362,54 +362,42 @@ function Get-DefenderEvents {
                     $flagCount++
                 }
 
-                # ── Verlauf gelöscht (1013) ────────────────────────────────
-                # Nicht nur anzeigen – direkt herausfinden was im Zeitfenster
-                # davor/danach erkannt wurde, um den gelöschten Eintrag zu rekonstruieren.
+                # ── Verlauf gelöscht (1013) – nur anzeigen wenn Threats im Zeitfenster ──
                 1013 {
-                    $flagCount++
-                    Write-Host ""
-                    Write-Host ("  " + "─" * 76) -ForegroundColor DarkRed
-                    Write-Host ("  [!!!] $timestamp  [1013]  SCHUTZVERLAUF-EINTRAG GELÖSCHT") -ForegroundColor Red
-                    Write-Host ("        Jemand hat einen Eintrag aus dem Schutzverlauf entfernt.") -ForegroundColor DarkYellow
-                    Write-Host ("        Suche nach Threats im Zeitfenster ±5 Minuten...") -ForegroundColor DarkYellow
-
-                    # Zeitfenster um den Lösch-Event
-                    $tMin = $event.TimeCreated.AddMinutes(-5)
-                    $tMax = $event.TimeCreated.AddMinutes(5)
-
-                    # Aus den bereits geladenen Events filtern (kein neuer API-Call nötig)
+                    $tMin   = $event.TimeCreated.AddMinutes(-5)
+                    $tMax   = $event.TimeCreated.AddMinutes(5)
                     $nearby = $events | Where-Object {
                         $_.TimeCreated -ge $tMin -and $_.TimeCreated -le $tMax -and
                         $_.Id -in @(1006,1007,1008,1009,1015,1116,1117,1118,1119)
                     }
+                    # Kein Threat in der Nähe = kein Informationswert, überspringen
+                    if (-not $nearby) { continue }
 
-                    if ($nearby) {
-                        Write-Host ("        Gefundene Threat-Events in diesem Zeitfenster:") -ForegroundColor Cyan
-                        foreach ($nb in $nearby | Sort-Object TimeCreated) {
-                            try {
-                                $nbXml      = [xml]$nb.ToXml()
-                                $nbTime     = $nb.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')
-                                $nbThreat   = Get-XmlData -Xml $nbXml -FieldName 'Threat Name'
-                                $nbPath     = Extract-ThreatPath -RawPath (Get-XmlData -Xml $nbXml -FieldName 'Path')
-                                $nbAction   = Get-XmlData -Xml $nbXml -FieldName 'Action Name'
-                                $nbSeverity = Get-XmlData -Xml $nbXml -FieldName 'Severity Name'
+                    $flagCount++
+                    Write-Host ""
+                    Write-Host ("  " + "─" * 76) -ForegroundColor DarkRed
+                    Write-Host ("  [!!!] $timestamp  [1013]  SCHUTZVERLAUF-EINTRAG GELÖSCHT") -ForegroundColor Red
+                    Write-Host ("        Threats im Zeitfenster ±5 Min:") -ForegroundColor Cyan
+                    foreach ($nb in $nearby | Sort-Object TimeCreated) {
+                        try {
+                            $nbXml      = [xml]$nb.ToXml()
+                            $nbTime     = $nb.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')
+                            $nbThreat   = Get-XmlData -Xml $nbXml -FieldName 'Threat Name'
+                            $nbPath     = Extract-ThreatPath -RawPath (Get-XmlData -Xml $nbXml -FieldName 'Path')
+                            $nbAction   = Get-XmlData -Xml $nbXml -FieldName 'Action Name'
+                            $nbSeverity = Get-XmlData -Xml $nbXml -FieldName 'Severity Name'
 
-                                $detail = "  ID=$($nb.Id)"
-                                if ($nbThreat)   { $detail += " | $nbThreat" }
-                                if ($nbSeverity) { $detail += " [$nbSeverity]" }
-                                if ($nbAction)   { $detail += " → $nbAction" }
-                                if ($nbPath)     { $detail += " | $nbPath" }
+                            $detail = "ID=$($nb.Id)"
+                            if ($nbThreat)   { $detail += " | $nbThreat" }
+                            if ($nbSeverity) { $detail += " [$nbSeverity]" }
+                            if ($nbAction)   { $detail += " → $nbAction" }
+                            if ($nbPath)     { $detail += " | $nbPath" }
 
-                                $isSusp = Test-CheatMatch -Text "$nbThreat $nbPath"
-                                $col    = if ($isSusp) { 'Yellow' } else { 'Gray' }
-                                Write-Host ("          $nbTime $detail") -ForegroundColor $col
-                                if ($isSusp) { Write-Host ("          >>> CHEAT-KEYWORD MATCH <<<") -ForegroundColor Yellow }
-                            } catch {}
-                        }
-                    }
-                    else {
-                        Write-Host ("        Keine direkten Threat-Events im Zeitfenster gefunden.") -ForegroundColor DarkGray
-                        Write-Host ("        Der Eintrag wurde möglicherweise gezielt entfernt bevor er sichtbar war.") -ForegroundColor DarkGray
+                            $isSusp = Test-CheatMatch -Text "$nbThreat $nbPath"
+                            $col    = if ($isSusp) { 'Yellow' } else { 'Gray' }
+                            Write-Host ("          $nbTime  $detail") -ForegroundColor $col
+                            if ($isSusp) { Write-Host ("          >>> CHEAT-KEYWORD MATCH <<<") -ForegroundColor Yellow }
+                        } catch {}
                     }
                     Write-Host ("  " + "─" * 76) -ForegroundColor DarkRed
                     Write-Host ""
@@ -489,43 +477,39 @@ function Show-CurrentExclusions {
 function Show-Quarantine {
     Write-Header "QUARANTÄNE-EINTRÄGE"
 
+    # MpCmdRun -Restore -ListAll gibt lesbare Einträge mit Name, Pfad und Datum
     $mpCmd = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
+    if (-not (Test-Path $mpCmd)) { $mpCmd = "$env:ProgramFiles (x86)\Windows Defender\MpCmdRun.exe" }
+
     if (-not (Test-Path $mpCmd)) {
-        $mpCmd = "$env:ProgramFiles (x86)\Windows Defender\MpCmdRun.exe"
+        Write-Host "  MpCmdRun.exe nicht gefunden." -ForegroundColor DarkGray
+        return
     }
 
-    if (Test-Path $mpCmd) {
-        try {
-            $output = & $mpCmd -Scan -ScanType 3 2>&1
-            Write-Host "  Quarantäne-Abfrage abgeschlossen." -ForegroundColor Cyan
-        }
-        catch {
-            Write-Host "  Fehler beim Ausführen von MpCmdRun.exe: $_" -ForegroundColor Red
-        }
-
-        # Quarantäne-Dateien direkt lesen
-        $quarantineDir = "$env:ProgramData\Microsoft\Windows Defender\Quarantine"
-        if (Test-Path $quarantineDir) {
-            $qFiles = Get-ChildItem -Path $quarantineDir -Recurse -ErrorAction SilentlyContinue
-            if ($qFiles) {
-                Write-Host "  Quarantäne-Ordner enthält $($qFiles.Count) Dateien/Ordner:" -ForegroundColor DarkYellow
-                foreach ($f in $qFiles | Select-Object -First 50) {
-                    $isSusp = Test-CheatMatch -Text $f.Name
-                    $color  = if ($isSusp) { 'Yellow' } else { 'Gray' }
-                    $prefix = if ($isSusp) { "  [!!!] " } else { "        " }
-                    Write-Host "${prefix}$($f.FullName) [$($f.LastWriteTime.ToString('yyyy-MM-dd HH:mm'))]" -ForegroundColor $color
-                }
-            }
-            else {
-                Write-Host "  Quarantäne-Ordner ist leer." -ForegroundColor Green
-            }
-        }
-        else {
-            Write-Host "  Quarantäne-Verzeichnis nicht zugänglich (Admin?)" -ForegroundColor DarkGray
-        }
+    try {
+        # -Restore -ListAll listet alle in Quarantäne befindlichen Bedrohungen
+        $lines = & $mpCmd -Restore -ListAll 2>&1 | Where-Object { $_ -match '\S' }
     }
-    else {
-        Write-Host "  MpCmdRun.exe nicht gefunden – Quarantäne-Abfrage nicht möglich." -ForegroundColor DarkGray
+    catch {
+        Write-Host "  Fehler: $_" -ForegroundColor Red
+        return
+    }
+
+    # MpCmdRun gibt "No items" oder leere Ausgabe wenn Quarantäne leer
+    $meaningful = $lines | Where-Object { $_ -notmatch '^\s*$' -and $_ -notmatch 'CmdTool' -and $_ -notmatch 'Copyright' -and $_ -notmatch '^\-+$' }
+
+    if (-not $meaningful -or ($meaningful -join '') -match 'No items|keine Elemente') {
+        Write-Host "  Quarantäne ist leer." -ForegroundColor Green
+        return
+    }
+
+    Write-Host ""
+    foreach ($line in $meaningful) {
+        $isSusp = Test-CheatMatch -Text $line
+        $color  = if ($isSusp) { 'Yellow' } else { 'Gray' }
+        $prefix = if ($isSusp) { "  [!!!] " } else { "        " }
+        Write-Host "${prefix}$line" -ForegroundColor $color
+        if ($isSusp) { Write-Host "         >>> CHEAT-KEYWORD MATCH <<<" -ForegroundColor Yellow }
     }
 }
 
