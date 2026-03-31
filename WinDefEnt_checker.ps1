@@ -1,18 +1,7 @@
 #Requires -Version 5.1
-$host.ui.RawUI.WindowTitle = "Windows Defender Event Viewer - Made by flomkk"
+$host.ui.RawUI.WindowTitle = "Windows Defender Events - by V!PER"
 Clear-Host
-Write-Host ""
-Write-Host -ForegroundColor Magenta @"
-   ███╗   ██╗ █████╗ ██████╗  ██████╗ ██████╗      ██████╗██╗████████╗██╗   ██╗
-   ████╗  ██║██╔══██╗██╔══██╗██╔════╝██╔═══██╗    ██╔════╝██║╚══██╔══╝╚██╗ ██╔╝
-   ██╔██╗ ██║███████║██████╔╝██║     ██║   ██║    ██║     ██║   ██║    ╚████╔╝
-   ██║╚██╗██║██╔══██║██╔══██╗██║     ██║   ██║    ██║     ██║   ██║     ╚██╔╝
-   ██║ ╚████║██║  ██║██║  ██║╚██████╗╚██████╔╝    ╚██████╗██║   ██║      ██║
-   ╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝      ╚═════╝╚═╝   ╚═╝      ╚═╝
-"@
-Write-Host -ForegroundColor White "                    Made by flomkk - " -NoNewLine
-Write-Host -ForegroundColor Cyan "discord.gg/narcocity"
-Write-Host ""
+Write-Host -ForegroundColor White "Made by V!PER" -NoNewLine
 
 # ─────────────────────────────────────────────────────────────────────────────
 # KONFIGURATION
