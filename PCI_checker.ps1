@@ -295,8 +295,9 @@ foreach ($item in $integrityItems) {
 if ($SystemIntegrity.SecureBoot -match "DEAKTIVIERT")  { Add-RiskPoints 10 10; Add-Finding "BIOS/UEFI" "HOCH"    "Secure Boot deaktiviert"                    $SystemIntegrity.SecureBoot }
 if ($SystemIntegrity.TestSigning -match "\[!\]")        { Add-RiskPoints 15 15; Add-Finding "BIOS/UEFI" "HOCH"    "Testsigning aktiviert"                      "Erlaubt unsignierte Treiber" }
 if ($SystemIntegrity.DSE_Status  -match "\[!!!\]")      { Add-RiskPoints 25 25; Add-Finding "BIOS/UEFI" "KRITISCH" "Driver Signature Enforcement deaktiviert"  "nointegritychecks=Yes in BCD" }
-if ($SystemIntegrity.Hypervisor  -match "HYPERVISOR")   { Add-RiskPoints 10 10; Add-Finding "BIOS/UEFI" "MITTEL"  "Hypervisor aktiv"                          "Moegliche VM-Bypass-Methode" }
-if ($SystemIntegrity.IOMMU       -match "NICHT")        { Add-RiskPoints  5 10; Add-Finding "BIOS/UEFI" "NIEDRIG" "IOMMU nicht verfuegbar"                    "Kein DMA-Schutz vorhanden" }
+# Hypervisor: nur noch INFO-Level - WSL2, Hyper-V, VBS und Kernisolierung aktivieren dies standardmaessig
+if ($SystemIntegrity.Hypervisor  -match "HYPERVISOR")  { Add-RiskPoints  2 10; Add-Finding "BIOS/UEFI" "NIEDRIG" "Hypervisor aktiv (WSL2/VBS/Hyper-V normal)" "Nur relevant in Kombination mit anderen Funden" }
+if ($SystemIntegrity.IOMMU       -match "NICHT")       { Add-RiskPoints  3 10; Add-Finding "BIOS/UEFI" "NIEDRIG" "IOMMU nicht verfuegbar"                    "Kein Hardware-DMA-Schutz" }
 
 Write-SectionEnd
 
@@ -394,40 +395,71 @@ $results = $allPciDevices | ForEach-Object {
         $flags.Add("[USB-PCIe-Bridge]"); $devScore += 20
     }
 
-    # 5. Unsignierter / Drittanbieter-Treiber
+    # 5. Unsignierter Treiber ist echtes Red Flag; 3rd-Party allein ist kein Beweis
     if ($drvSigner -match "^Unsigniert$") { $flags.Add("[UNSIGN-DRV]"); $devScore += 25 }
-    elseif ($drvSigner -match "^3rd-Party") { $flags.Add("[3RD-PARTY-DRV] $drvSigner"); $devScore += 10 }
+    # 3rd-Party nur flaggen wenn KEIN bekannter Peripherie-Hersteller
+    elseif ($drvSigner -match "^3rd-Party") {
+        $signerRaw = $drvSigner -replace "^3rd-Party: ",""
+        $legitPeripheral = $signerRaw -match "Logitech|Razer|Corsair|SteelSeries|ROCCAT|HyperX|Kingston|Creative|Turtle Beach|Plantronics|Jabra|Elgato|AVerMedia|Wacom|Huion|XP-Pen|Tobii|Elmo|ASUS|Acer|Lenovo|Dell|HP|MSI|Gigabyte|Samsung|Seagate|Western Digital|WD|Crucial|Micron|Sandisk"
+        if (-not $legitPeripheral) {
+            $flags.Add("[3RD-PARTY-DRV] $drvSigner"); $devScore += 8
+        }
+    }
 
     # 6. Kein Treiber bei AKTIVEM Geraet (Status 0 oder 43)
     if ($drvVersion -eq "N/A" -and $statusCode -in @(0, 43)) {
         $flags.Add("[NO-DRV-ACTIVE]"); $devScore += 15
     }
 
-    # 7. Treiber-Datum-Anomalie: Treiber juenger als 1 Tag oder vor Jahr 2010
+    # 7. Treiber-Datum-Anomalie: Treiber juenger als 2 Tage = brandneu (Cheat-Treiber werden frisch installiert)
+    #    KEIN Flag fuer alte Daten (1968/2006 ist normales BIOS/ACPI-Verhalten bei Intel/Microsoft)
     if ($drvDate -ne $null) {
         $daysDiff = (Get-Date) - $drvDate
-        if ($daysDiff.TotalDays -lt 1) { $flags.Add("[DRV-DATE] Treiber heute erstellt!"); $devScore += 20 }
-        if ($drvDate.Year -lt 2010)    { $flags.Add("[DRV-DATE] Suspekt alt ($($drvDate.Year))"); $devScore += 10 }
+        if ($daysDiff.TotalDays -lt 2 -and $drvDate.Year -gt 2000) {
+            $flags.Add("[DRV-DATE] Treiber brandneu ($($drvDate.ToString('yyyy-MM-dd')))"); $devScore += 20
+        }
     }
 
     # 8. SPOOF-HEURISTIK: Bekannter Vendor, aber Subsystem passt nicht
     if ($vendorID -eq "10DE" -and $subSysID -ne "N/A") {
-        # Nvidia-Karten haben typischerweise SubSys-IDs von Board-Partnern (1043=ASUS, 1462=MSI etc.)
-        $knownNvSubVendors = @("1043","1462","1458","196E","3842","1682","1B4C","10DE","19DA","1569","7377")
+        # Board-Partner + grosse OEMs (Lenovo, Dell, HP, etc.) die NVIDIA-GPUs verbauen
+        $knownNvSubVendors = @(
+            # AIB-Partner
+            "1043","1462","1458","196E","3842","1682","1B4C","10DE","19DA","1569","7377",
+            "1ACC","1048","1642","1048","16F3","1D05","1CEB","1048","1849",
+            # OEM-Laptop-Hersteller
+            "17AA",  # Lenovo (ThinkPad, Legion, IdeaPad)
+            "1028",  # Dell (XPS, Alienware, Precision)
+            "103C",  # HP (Omen, Envy, EliteBook)
+            "1591",  # HP (alternativ, Workstations)
+            "104D",  # Sony
+            "1179",  # Toshiba / Dynabook
+            "1025",  # Acer / Predator
+            "1558",  # Clevo / Tongfang (Schenker, XMG etc.)
+            "1B0A",  # Pegatron
+            "8086",  # Intel NUC mit diskreter GPU
+            "1AF4",  # VirtIO/Red Hat (VM-Passthrough)
+            "0000"   # Kein SubSystem gesetzt
+        )
         $subVendor = $subSysID.Substring(4,4)
-        if ($subVendor -notin $knownNvSubVendors -and $subVendor -ne "0000") {
+        if ($subVendor -notin $knownNvSubVendors) {
             $flags.Add("[SPOOF-SUBSYS] NV-Karte mit unbekanntem Board-Vendor $subVendor"); $devScore += 30
         }
     }
 
     # 9. Intel-VID aber kein Intel-Signer
-    if ($vendorID -eq "8086" -and $drvSigner -notmatch "Intel|Microsoft" -and $drvSigner -ne "Kein Treiber") {
-        $flags.Add("[SPOOF-SIGNER] Intel-VID ohne Intel-Treiber"); $devScore += 25
+    # Ausnahme: Standard-Geraete wie PCI-Bridges, Host-Bridge, ACPI, ISA-Bridge werden von Microsoft signiert
+    $isIntelStandardDevice = $caption -match "PCI Standard|Host-Bridge|Host Bridge|ISA-Bridge|ISA Bridge|ACPI|PCI-Express-Stamm|PCI Express Root|SMBus|System CMOS|System Management"
+    if ($vendorID -eq "8086" -and -not $isIntelStandardDevice -and
+        $drvSigner -notmatch "Intel|Microsoft" -and $drvSigner -ne "Kein Treiber") {
+        $flags.Add("[SPOOF-SIGNER] Intel-VID ohne Intel/MS-Treiber"); $devScore += 25
     }
 
     # 10. AMD-VID aber kein AMD/Microsoft-Signer
-    if ($vendorID -in @("1002","1022") -and $drvSigner -notmatch "AMD|Microsoft" -and $drvSigner -ne "Kein Treiber") {
-        $flags.Add("[SPOOF-SIGNER] AMD-VID ohne AMD-Treiber"); $devScore += 25
+    $isAmdStandardDevice = $caption -match "PCI Standard|Host-Bridge|Host Bridge|ACPI|SMBus"
+    if ($vendorID -in @("1002","1022") -and -not $isAmdStandardDevice -and
+        $drvSigner -notmatch "AMD|Microsoft" -and $drvSigner -ne "Kein Treiber") {
+        $flags.Add("[SPOOF-SIGNER] AMD-VID ohne AMD/MS-Treiber"); $devScore += 25
     }
 
     # Status bestimmen
@@ -510,8 +542,12 @@ if (-not $SkipRegistry) {
 
                     $ghostScore = 0
                     $ghostFlags = [System.Collections.Generic.List[string]]::new()
-                    if ($gVendor -in $DmaVendorIDs) { $ghostFlags.Add("[FPGA/DMA-VID]"); $ghostScore += 40 }
-                    if ($friendlyName -match "Xilinx|Altera|FPGA|PCILeech|Xillybus") { $ghostFlags.Add("[FPGA-NAME]"); $ghostScore += 40 }
+                    # Ghost-Geraete mit FPGA-Bezug sind extrem verdaechtig:
+                    # Ein DMA-Cheat der abgesteckt wurde hinterlaesst genau diesen Registry-Eintrag
+                    if ($gVendor -in $DmaVendorIDs) { $ghostFlags.Add("[FPGA/DMA-VID]"); $ghostScore += 70 }
+                    if ($friendlyName -match "Xilinx|Altera|FPGA|PCILeech|Xillybus|Artix|Kintex|Spartan|Lattice|ECP5") {
+                        $ghostFlags.Add("[FPGA-NAME]"); $ghostScore += 70
+                    }
 
                     $ghostDevices.Add([PSCustomObject]@{
                         "Geraetename"  = $friendlyName
@@ -537,8 +573,8 @@ if (-not $SkipRegistry) {
             Write-Crit "$($critGhosts.Count) Ghost-Geraete mit FPGA/DMA-Verdacht!"
             foreach ($g in $critGhosts) {
                 Write-Crit "  $($g.Geraetename) | VEN:$($g.'Vendor ID') DEV:$($g.'Device ID') | $($g.Flags)"
-                Add-RiskPoints $g._Score 40
-                Add-Finding "Ghost-Geraet" "KRITISCH" "$($g.Geraetename) [GHOST]" $g.Flags
+                Add-RiskPoints $g._Score 70   # Max 70 fuer Ghost-FPGA (hochstes Gewicht)
+                Add-Finding "Ghost-Geraet" "KRITISCH" "$($g.Geraetename) [GHOST - war eingesteckt!]" $g.Flags
             }
         }
     } else {
@@ -581,9 +617,9 @@ $tbDevices = Get-CimInstance Win32_PnPEntity |
     Select-Object Caption, Manufacturer, DeviceID
 
 foreach ($tb in $tbDevices) {
-    Write-Warn "Thunderbolt/USB4 Interface: $($tb.Caption)"
-    Add-RiskPoints 5 10
-    Add-Finding "USB/Thunderbolt" "MITTEL" "Thunderbolt-Interface gefunden" $tb.Caption
+    # Thunderbolt ist auf Laptops und modernen Mainboards standard - nur INFO, kein echter Risk
+    if ($Verbose) { Write-Step "Thunderbolt/USB4 Interface gefunden: $($tb.Caption)" "Gray" }
+    # Kein Add-RiskPoints hier - Thunderbolt allein ist kein Indiz
 }
 
 # Externe PCIe-Erweiterungskarten ueber USB
@@ -609,6 +645,106 @@ if ($usbSuspects.Count -gt 0) {
 
 if ($tbDevices.Count -eq 0 -and $extPcie.Count -eq 0) {
     Write-OK "Keine Thunderbolt/USB4/eGPU-Interfaces gefunden."
+}
+Write-SectionEnd
+
+# ==============================================================================
+# MODUL 5.5: PCIe LINK-WIDTH ANALYSE (Lane-Speed Check)
+# ==============================================================================
+Write-Section "MODUL 5.5: PCIe Link-Width Analyse (Lane-Spoof-Check)"
+Write-Step "Lese PCIe Link-Breite aus Registry (GPU x1 statt x16 = kritisch)..."
+
+# Grafikkarten-Vendor IDs fuer GPU-Erkennung
+$gpuVendorIDs = @("10DE","1002","8086")  # NVIDIA, AMD, Intel Arc
+
+# Lese Link-Width Infos aus dem PCI-Config-Space via Registry
+# Windows speichert diese unter HKLM:\SYSTEM\CurrentControlSet\Enum\PCI\<ID>\<Instanz>\Device Parameters
+$laneFindings = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+foreach ($dev in $results) {
+    $vid = $dev."Vendor ID"
+    $devName = $dev.Geraetename
+
+    # Nur Grafikkarten und PCIe-Geraete mit bekannten GPU-Vendors pruefen
+    $isGpuCandidate = ($vid -in $gpuVendorIDs -and $devName -match "GeForce|Radeon|RTX|GTX|RX\s*\d|Arc|MX\d|Quadro|Tesla|Vega|Navi") -or
+                      ($devName -match "VGA|Display|3D Video|Video Controller" -and $vid -in $gpuVendorIDs)
+    if (-not $isGpuCandidate) { continue }
+
+    # Registry-Pfad fuer dieses Geraet
+    $rawID    = $dev._DeviceID_Raw
+    # Extrahiere VEN_xxx&DEV_xxx Teil
+    $pciMatch = [regex]::Match($rawID, 'PCI\\([^\\]+)\\([^\\]+)')
+    if (-not $pciMatch.Success) { continue }
+    $hwPart   = $pciMatch.Groups[1].Value
+    $instPart = $pciMatch.Groups[2].Value
+    $regPath  = "HKLM:\SYSTEM\CurrentControlSet\Enum\PCI\$hwPart\$instPart\Device Parameters"
+
+    $linkWidth = $null
+    $maxWidth   = $null
+
+    # Methode 1: PciExpressCompatibility (W10/11)
+    try {
+        $pciExpress = Get-ItemProperty "$regPath\PciExpressCompatibility" -ErrorAction Stop
+        # LinkStatus Register: Bits 4-9 = Current Link Width, Bits 0-3 = Current Link Speed
+        if ($pciExpress.PSObject.Properties.Name -contains "LinkStatus") {
+            $ls = [int]$pciExpress.LinkStatus
+            $linkWidth = ($ls -shr 4) -band 0x3F
+        }
+    } catch {}
+
+    # Methode 2: Interrupt Management / Message Signaled Interrupts (enthaelt manchmal Config-Space-Dump)
+    if (-not $linkWidth) {
+        try {
+            $intMgmt = Get-ItemProperty "$regPath\Interrupt Management\MessageSignaledInterruptProperties" -ErrorAction Stop
+            # Kein direkter Lane-Wert hier - nur als Fallback-Indikator dass Geraet PCI-E ist
+        } catch {}
+    }
+
+    # Methode 3: Direkt aus dem PCI Config Space via WMI (nur wenn verfuegbar)
+    if (-not $linkWidth) {
+        try {
+            # Win32_PnPAllocatedResource gibt keine Lane-Info, aber wir koennen via
+            # ACPI0 oder PciRootBridge die MaxLinkWidth ermitteln
+            $pciProps = Get-ItemProperty $regPath -ErrorAction SilentlyContinue
+            if ($pciProps -and $pciProps.PSObject.Properties.Name -contains "PCIExpressLinkWidth") {
+                $linkWidth = [int]$pciProps.PCIExpressLinkWidth
+            }
+            if ($pciProps -and $pciProps.PSObject.Properties.Name -contains "PCIExpressMaxLinkWidth") {
+                $maxWidth = [int]$pciProps.PCIExpressMaxLinkWidth
+            }
+        } catch {}
+    }
+
+    # Auswertung: Wenn Link-Breite ausgelesen werden konnte
+    if ($linkWidth -ne $null -and $linkWidth -gt 0) {
+        $laneInfo = "x$linkWidth"
+        if ($maxWidth) { $laneInfo += " (Max: x$maxWidth)" }
+
+        # Eine dedizierte GPU laeuft typischerweise auf x16 oder mindestens x8
+        # x1 oder x2 bei einer dGPU ist ein starkes Spoof-Indiz
+        if ($linkWidth -le 2 -and $maxWidth -gt 2) {
+            $msg = "$devName laeuft auf $laneInfo - SOLLTE x$maxWidth sein!"
+            Write-Crit $msg
+            $laneFindings.Add([PSCustomObject]@{ Geraet=$devName; LinkWidth=$linkWidth; MaxWidth=$maxWidth; VID=$vid })
+            Add-RiskPoints 40 40
+            Add-Finding "PCIe-Lanes" "KRITISCH" "GPU mit verdaechtiger Lane-Breite" $msg
+        } elseif ($linkWidth -le 4 -and $maxWidth -ge 16) {
+            $msg = "$devName laeuft nur auf $laneInfo (Max: x$maxWidth) - Anomalie!"
+            Write-Warn $msg
+            $laneFindings.Add([PSCustomObject]@{ Geraet=$devName; LinkWidth=$linkWidth; MaxWidth=$maxWidth; VID=$vid })
+            Add-RiskPoints 20 40
+            Add-Finding "PCIe-Lanes" "HOCH" "GPU mit reduzierter Lane-Breite" $msg
+        } else {
+            Write-OK "$devName: PCIe $laneInfo (unauffaellig)"
+        }
+    } else {
+        # Lane-Info nicht auslesbar - kein Flag, nur Info in Verbose
+        if ($Verbose) { Write-Step "$devName : Lane-Breite nicht aus Registry auslesbar (normal bei aelteren Treibern)" "Gray" }
+    }
+}
+
+if ($laneFindings.Count -eq 0) {
+    Write-OK "Alle GPU-Lane-Breiten unauffaellig (oder nicht auslesbar)."
 }
 Write-SectionEnd
 
@@ -712,11 +848,15 @@ if ($idGroups.Count -gt 0) {
     Write-OK "Keine duplizierten Hardware-IDs."
 }
 
-# Pruefe auf Geraete die bekannte IDs imitieren (z.B. VEN=10DE aber Name passt nicht)
+# Pruefe auf Geraete die bekannte GPU-IDs faelschen
+# ACHTUNG: Nur pruefen ob eine GPU-Vendor-ID verwendet wird, der Name aber KEINE GPU ist.
+# Intel (8086) und AMD (1002/1022) haben hunderte legitime Non-GPU-Geraete -> KEIN generischer Mismatch!
+# Nur NVIDIA (10DE) wird geprueft: Wenn VEN=10DE aber kein NVIDIA-GPU-Name -> Spoof-Verdacht.
 $spoofSuspects = $results | Where-Object {
-    ($_."Vendor ID" -eq "10DE" -and $_."Geraetename" -notmatch "NVIDIA|GeForce|Quadro|Tesla|NVS|NForce|nForce") -or
-    ($_."Vendor ID" -eq "8086" -and $_."Geraetename" -notmatch "Intel|HD|UHD|Iris|Arc|Ethernet|Audio|USB|SATA|NVM|PCH|SMBus|Thermal|Management|LAN|Wi-Fi|Bluetooth|ME|QST|Platform|Bridge|Root" -and $_."Geraetename" -ne "(Kein Name)") -or
-    ($_."Vendor ID" -eq "1002" -and $_."Geraetename" -notmatch "AMD|Radeon|RX|Vega|Navi|Polaris|Ellesmere|Fiji|Hawaii|Audio|USB|HDMI")
+    # NV-VID aber kein einziger NVIDIA/GPU-Begriff im Namen UND kein bekannter NV-Nicht-GPU-Begriff
+    $_."Vendor ID" -eq "10DE" -and
+    $_."Geraetename" -notmatch "NVIDIA|GeForce|Quadro|Tesla|NVS|NForce|nForce|RTX|GTX|MX\d|High Definition Audio|Virtual Audio|USB|HDMI|DisplayPort" -and
+    $_."Geraetename" -ne "(Kein Name)"
 }
 
 if ($spoofSuspects.Count -gt 0) {
