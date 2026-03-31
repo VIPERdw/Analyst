@@ -735,7 +735,7 @@ foreach ($dev in $results) {
             Add-RiskPoints 20 40
             Add-Finding "PCIe-Lanes" "HOCH" "GPU mit reduzierter Lane-Breite" $msg
         } else {
-            Write-OK "$devName: PCIe $laneInfo (unauffaellig)"
+            Write-OK "${devName}: PCIe $laneInfo (unauffaellig)"
         }
     } else {
         # Lane-Info nicht auslesbar - kein Flag, nur Info in Verbose
