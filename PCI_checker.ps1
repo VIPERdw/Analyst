@@ -463,7 +463,8 @@ $suspicious = $results | Where-Object { $_.Verdacht -ne "OK" } | Sort-Object "_S
 foreach ($dev in $suspicious) {
     $sc = [int]$dev._Score
     Add-RiskPoints $sc 50
-    Add-Finding "PCIe-Geraet" (if ($sc -ge 40) {"KRITISCH"} elseif ($sc -ge 20) {"HOCH"} else {"MITTEL"}) `
+    $devSchwere = if ($sc -ge 40) { "KRITISCH" } elseif ($sc -ge 20) { "HOCH" } else { "MITTEL" }
+    Add-Finding "PCIe-Geraet" $devSchwere `
         "$($dev.Geraetename) [VEN:$($dev.'Vendor ID') DEV:$($dev.'Device ID')]" $dev.Verdacht
 }
 
