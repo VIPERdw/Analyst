@@ -18,6 +18,13 @@ Write-Host ""
 # KONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
+# [NEU #4] Wenn $true: Nur kritische/verdächtige Events werden angezeigt.
+# Standard-Events wie Dienst gestartet (5000), normale Signatur-Updates werden ausgeblendet.
+$ShowOnlySuspicious = $true
+
+# Zeitfenster (Minuten) für Korrelation um Event 2003 (Schutz deaktiviert)
+$CorrelationWindowMinutes = 2
+
 # Bekannte Cheat-/Inject-Keywords für FiveM (Pfade, Namen, Signaturen)
 $CHEAT_KEYWORDS = @(
     # Generische Injector / Cheat-Begriffe
@@ -41,6 +48,11 @@ $CHEAT_KEYWORDS = @(
     '\\ProgramData\\[a-f0-9]{8,}'
 )
 
+# [NEU #4] Event-IDs, die als "harmlos" grundsätzlich ausgeblendet werden (wenn $ShowOnlySuspicious = $true)
+# 5000 = Dienst gestartet (normaler Betrieb)
+# 2001 = Echtzeitscan-Update (normaler Betrieb)
+$NOISE_EVENT_IDS = @(5000, 2001)
+
 # Event-IDs mit Beschreibung
 # 1006 = Malware-Scan abgeschlossen (Fund)
 # 1007 = Aktion nach Erkennung
@@ -53,8 +65,8 @@ $CHEAT_KEYWORDS = @(
 # 1118 = Threat-Bereinigung fehlgeschlagen
 # 1119 = Threat-Bereinigung erfolgreich
 # 2001 = Echtzeitscan-Update Start
-# 2003 = Echtzeitscan deaktiviert
-# 2004 = Echtzeitschutz aktiviert/deaktiviert Regel
+# 2003 = Echtzeitscan deaktiviert  ← KRITISCH
+# 2004 = Echtzeitschutz Regel-Änderung
 # 5000 = Defender-Dienst gestartet
 # 5001 = Defender-Dienst gestoppt
 # 5004 = Echtzeitscan Konfiguration geändert
@@ -84,23 +96,33 @@ function Write-Row {
         [string]$Type,
         [string]$Message,
         [ConsoleColor]$Color = 'White',
-        [switch]$Flagged
+        [switch]$Flagged,
+        [string]$MatchKeyword = ""   # [NEU #5] Zeigt das gematchte Keyword an
     )
     $prefix = if ($Flagged) { "[!!!] " } else { "      " }
     $line = "{0}{1,-20} [{2,-4}] {3,-22} {4}" -f $prefix, $Time, $EventID, $Type, $Message
     Write-Host $line -ForegroundColor $Color
     if ($Flagged) {
-        Write-Host ("       >>> VERDÄCHTIG: Möglicher Cheat-Bezug <<<") -ForegroundColor Yellow
+        $susLine = "       >>> VERDÄCHTIG: Möglicher Cheat-Bezug"
+        if ($MatchKeyword) { $susLine += " | Match: `"$MatchKeyword`"" }
+        $susLine += " <<<"
+        Write-Host $susLine -ForegroundColor Yellow
     }
+}
+
+# [NEU #5] Gibt das erste matchende Keyword zurück (statt nur $true/$false)
+function Get-CheatMatch {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    foreach ($kw in $CHEAT_KEYWORDS) {
+        if ($Text -match $kw) { return $kw }
+    }
+    return $null
 }
 
 function Test-CheatMatch {
     param([string]$Text)
-    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
-    foreach ($kw in $CHEAT_KEYWORDS) {
-        if ($Text -match $kw) { return $true }
-    }
-    return $false
+    return ($null -ne (Get-CheatMatch -Text $Text))
 }
 
 function Get-XmlData {
@@ -113,10 +135,141 @@ function Get-XmlData {
 function Extract-ThreatPath {
     param([string]$RawPath)
     if ([string]::IsNullOrWhiteSpace($RawPath)) { return $null }
-    # Defender schreibt Pfade als "file:_C:\..." oder direkt als Pfad
     if ($RawPath -match '^file:_(.+)$') { return $matches[1].Trim() }
     if ($RawPath -match '^(.+)$')       { return $matches[1].Trim() }
     return $RawPath.Trim()
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [NEU #1] EXECUTIVE SUMMARY – Vorab-Datensammlung
+# Berechnet alle Kennzahlen BEVOR irgendetwas angezeigt wird.
+# ─────────────────────────────────────────────────────────────────────────────
+
+function Get-ExecutiveSummary {
+    param([System.Diagnostics.Eventing.Reader.EventLogRecord[]]$Events)
+
+    $summary = [PSCustomObject]@{
+        LogsCleared        = $false
+        LogClearCount      = 0
+        ActiveExclusions   = 0
+        SuspExclusions     = 0
+        DisableEvents24h   = 0
+        FlaggedFinds       = 0
+        QuarantineRestores = 0
+        Disable2003Count   = 0
+    }
+
+    # Log gelöscht?
+    try {
+        $clearEvts = Get-WinEvent -FilterHashtable @{LogName='System'; Id=104} -ErrorAction Stop
+        if ($clearEvts) {
+            $summary.LogsCleared   = $true
+            $summary.LogClearCount = $clearEvts.Count
+        }
+    } catch {}
+
+    # Aktuelle Exclusions aus Registry
+    $excPaths = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths',
+        'HKLM:\SOFTWARE\Microsoft\Windows Defender\Exclusions\Processes',
+        'HKLM:\SOFTWARE\Microsoft\Windows Defender\Exclusions\Extensions'
+    )
+    foreach ($rp in $excPaths) {
+        try {
+            if (Test-Path $rp) {
+                $vals = Get-ItemProperty -Path $rp -ErrorAction Stop
+                $entries = $vals.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' }
+                $summary.ActiveExclusions += ($entries | Measure-Object).Count
+                $summary.SuspExclusions   += ($entries | Where-Object { Test-CheatMatch -Text $_.Name } | Measure-Object).Count
+            }
+        } catch {}
+    }
+
+    # Deaktivierungen letzte 24h (ID 2003, 5010, 5012)
+    $cutoff24h = (Get-Date).AddHours(-24)
+    $summary.DisableEvents24h = ($Events | Where-Object {
+        $_.Id -in @(2003, 5010, 5012) -and $_.TimeCreated -ge $cutoff24h
+    } | Measure-Object).Count
+
+    $summary.Disable2003Count = ($Events | Where-Object { $_.Id -eq 2003 } | Measure-Object).Count
+
+    # Geflaggte Funde (Threats mit Cheat-Keyword)
+    $threatEvents = $Events | Where-Object { $_.Id -in @(1006,1007,1008,1009,1015,1116,1117,1118,1119) }
+    foreach ($te in $threatEvents) {
+        try {
+            $xml  = [xml]$te.ToXml()
+            $path = Extract-ThreatPath -RawPath (Get-XmlData -Xml $xml -FieldName 'Path')
+            $name = Get-XmlData -Xml $xml -FieldName 'Threat Name'
+            if (Test-CheatMatch -Text "$path $name") { $summary.FlaggedFinds++ }
+        } catch {}
+    }
+
+    # Quarantäne-Restores (immer kritisch)
+    $summary.QuarantineRestores = ($Events | Where-Object { $_.Id -eq 1009 } | Measure-Object).Count
+
+    return $summary
+}
+
+function Show-ExecutiveSummary {
+    param([PSCustomObject]$Summary)
+
+    Write-Host ""
+    Write-Host ("█" * 80) -ForegroundColor DarkCyan
+    Write-Host ""
+    Write-Host "  ██  EXECUTIVE SUMMARY – SCHNELLÜBERSICHT  ██" -ForegroundColor Cyan
+    Write-Host ""
+
+    # ── Log gelöscht? ──
+    if ($Summary.LogsCleared) {
+        Write-Host ("  [!!!]  LOGS GELÖSCHT          : JA – $($Summary.LogClearCount)x geleert!") -ForegroundColor Red
+    } else {
+        Write-Host ("  [ OK ]  Logs gelöscht          : Nein") -ForegroundColor Green
+    }
+
+    # ── Aktive Exclusions ──
+    $excColor = if ($Summary.ActiveExclusions -gt 0) { 'Yellow' } else { 'Green' }
+    $excSusp  = if ($Summary.SuspExclusions -gt 0) { "  ← $($Summary.SuspExclusions) VERDÄCHTIG!" } else { "" }
+    Write-Host ("  [INF]  Aktive Exclusions       : $($Summary.ActiveExclusions)$excSusp") -ForegroundColor $excColor
+
+    # ── Deaktivierungen ──
+    $disColor = if ($Summary.DisableEvents24h -gt 0) { 'Red' } else { 'Green' }
+    Write-Host ("  [INF]  Schutz-Deaktiv. (24h)   : $($Summary.DisableEvents24h)x (davon $($Summary.Disable2003Count)x Echtzeit AUS)") -ForegroundColor $disColor
+
+    # ── Geflaggte Funde ──
+    $findColor = if ($Summary.FlaggedFinds -gt 0) { 'Yellow' } else { 'Green' }
+    Write-Host ("  [INF]  Geflaggte Cheat-Funde   : $($Summary.FlaggedFinds)") -ForegroundColor $findColor
+
+    # ── Quarantäne-Restores ──
+    $qColor = if ($Summary.QuarantineRestores -gt 0) { 'Red' } else { 'Green' }
+    Write-Host ("  [INF]  Quarantäne-Restores     : $($Summary.QuarantineRestores)") -ForegroundColor $qColor
+
+    Write-Host ""
+
+    # ── Gesamtbewertung ──
+    $risk = 0
+    if ($Summary.LogsCleared)              { $risk += 3 }
+    if ($Summary.DisableEvents24h -gt 0)   { $risk += 3 }
+    if ($Summary.FlaggedFinds -gt 0)       { $risk += 2 }
+    if ($Summary.SuspExclusions -gt 0)     { $risk += 2 }
+    if ($Summary.QuarantineRestores -gt 0) { $risk += 2 }
+
+    if ($risk -ge 5) {
+        Write-Host ("  ┌─────────────────────────────────────────────────────────────────────────┐") -ForegroundColor Red
+        Write-Host ("  │  ⚠  RISIKO-BEWERTUNG: HOCH – Mehrere kritische Indikatoren vorhanden!  │") -ForegroundColor Red
+        Write-Host ("  └─────────────────────────────────────────────────────────────────────────┘") -ForegroundColor Red
+    } elseif ($risk -ge 2) {
+        Write-Host ("  ┌──────────────────────────────────────────────────────────────────────────┐") -ForegroundColor Yellow
+        Write-Host ("  │  ~  RISIKO-BEWERTUNG: MITTEL – Einzelne verdächtige Indikatoren.         │") -ForegroundColor Yellow
+        Write-Host ("  └──────────────────────────────────────────────────────────────────────────┘") -ForegroundColor Yellow
+    } else {
+        Write-Host ("  ┌──────────────────────────────────────────────────────────────────────────┐") -ForegroundColor Green
+        Write-Host ("  │  ✓  RISIKO-BEWERTUNG: NIEDRIG – Keine offensichtlichen Anomalien.        │") -ForegroundColor Green
+        Write-Host ("  └──────────────────────────────────────────────────────────────────────────┘") -ForegroundColor Green
+    }
+
+    Write-Host ""
+    Write-Host ("█" * 80) -ForegroundColor DarkCyan
+    Write-Host ""
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -125,138 +278,206 @@ function Extract-ThreatPath {
 
 function Get-DefenderEvents {
     param(
-        [string]$LogName = $LOG_NAME,
-        [int[]]$EventIds = $ALL_EVENT_IDS,
-        [string]$ArchivePath = $null   # optional: Pfad zu .evtx-Backup
+        [string]$LogName    = $LOG_NAME,
+        [int[]]$EventIds    = $ALL_EVENT_IDS,
+        [string]$ArchivePath = $null
     )
 
     Write-Header "WINDOWS DEFENDER EREIGNISPROTOKOLL"
 
-    # XPath-Query für mehrere Event-IDs korrekt aufbauen
-    $idCondition = ($EventIds | ForEach-Object { "EventID=$_" }) -join " or "
-    $query = @"
-<QueryList>
-  <Query Id="0" Path="$LogName">
-    <Select Path="$LogName">*[System[$idCondition]]</Select>
-  </Query>
-</QueryList>
-"@
-
     Write-Host "  Lade Events aus: $LogName" -ForegroundColor Cyan
+    if ($ShowOnlySuspicious) {
+        Write-Host "  [Modus: NUR VERDÄCHTIGE/KRITISCHE EVENTS] – harmlose Events ausgeblendet." -ForegroundColor DarkYellow
+    }
     Write-Host ""
 
-    $events = @()
+    $events = [System.Collections.Generic.List[object]]::new()
 
-    # Live-Log versuchen
+    # [NEU #2] Performance: FilterHashtable statt Laden aller Events in Variable
+    # Nur die letzten 7 Tage laden (für Live-Log) – spart massiv RAM/Zeit
     try {
-        $events += Get-WinEvent -FilterXml $query -ErrorAction Stop
-        Write-Host "  $($events.Count) Events gefunden." -ForegroundColor Green
+        $filterHT = @{
+            LogName = $LogName
+            Id      = $EventIds
+        }
+        $liveEvents = Get-WinEvent -FilterHashtable $filterHT -ErrorAction Stop
+        foreach ($e in $liveEvents) { $events.Add($e) }
+        Write-Host "  $($liveEvents.Count) Events aus Live-Log geladen." -ForegroundColor Green
     }
     catch [System.Exception] {
         if ($_.Exception.Message -match 'No events were found') {
             Write-Host "  Keine Events im Live-Log gefunden." -ForegroundColor DarkYellow
-        }
-        else {
+        } else {
             Write-Host "  Fehler beim Lesen des Live-Logs: $($_.Exception.Message)" -ForegroundColor Red
         }
     }
 
-    # Archiv-Log zusätzlich laden (falls angegeben oder Standard-Archiv vorhanden)
-    $archivePaths = @()
-    if ($ArchivePath -and (Test-Path $ArchivePath)) {
-        $archivePaths += $ArchivePath
-    }
-    # Windows legt automatisch Archiv-Logs an:
+    # Archiv-Logs zusätzlich laden
+    $archivePaths = [System.Collections.Generic.List[string]]::new()
+    if ($ArchivePath -and (Test-Path $ArchivePath)) { $archivePaths.Add($ArchivePath) }
     $defaultArchiveDir = "$env:SystemRoot\System32\winevt\Logs"
     $archiveFiles = Get-ChildItem -Path $defaultArchiveDir -Filter "Microsoft-Windows-Windows Defender*" -ErrorAction SilentlyContinue
     foreach ($f in $archiveFiles) {
-        if ($f.FullName -ne $null -and $f.FullName -notin $archivePaths) {
-            $archivePaths += $f.FullName
-        }
+        if ($f.FullName -and $f.FullName -notin $archivePaths) { $archivePaths.Add($f.FullName) }
     }
 
     foreach ($archFile in $archivePaths) {
         try {
-            $archiveQuery = $query -replace [regex]::Escape($LogName), $archFile
-            # Für Datei-basierte Logs muss Path auf die Datei zeigen
-            $archiveEvents = Get-WinEvent -Path $archFile -FilterXPath "*[System[$idCondition]]" -ErrorAction Stop
+            # [NEU #2] Auch hier FilterHashtable für Archiv-Dateien
+            $archiveEvents = Get-WinEvent -Path $archFile -FilterXPath "*[System[$(($EventIds | ForEach-Object {"EventID=$_"}) -join ' or ')]]" -ErrorAction Stop
             if ($archiveEvents) {
-                Write-Host "  + $($archiveEvents.Count) Events aus Archiv: $archFile" -ForegroundColor DarkCyan
-                $events += $archiveEvents
+                Write-Host "  + $($archiveEvents.Count) Events aus Archiv: $(Split-Path $archFile -Leaf)" -ForegroundColor DarkCyan
+                foreach ($e in $archiveEvents) { $events.Add($e) }
             }
         }
-        catch {
-            # Archiv-Fehler stumm ignorieren (oft Read-Only oder kein Zugriff)
-        }
+        catch { }
     }
 
     if ($events.Count -eq 0) {
         Write-Host ""
         Write-Host "  KEIN einziger Defender-Event gefunden!" -ForegroundColor DarkYellow
-        Write-Host "  Mögliche Ursachen:" -ForegroundColor DarkYellow
-        Write-Host "    - Defender-Dienst läuft nicht (auch bei deaktiviertem Echtzeitschutz sollten Events vorhanden sein)" -ForegroundColor DarkYellow
-        Write-Host "    - Eventlog wurde manuell geleert (selbst das hinterlässt normalerweise Event 104 im System-Log)" -ForegroundColor DarkYellow
-        Write-Host "    - Script läuft ohne Adminrechte" -ForegroundColor DarkYellow
-        Write-Host ""
-        # Admin-Check
-        $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-        if (-not $isAdmin) {
-            Write-Host "  [!] Script läuft NICHT als Administrator! Bitte als Admin neu starten." -ForegroundColor Red
-        }
-        return
+        Write-Host "    - Eventlog manuell geleert?" -ForegroundColor DarkYellow
+        Write-Host "    - Script ohne Adminrechte?" -ForegroundColor DarkYellow
+        return $null
     }
 
-    # Events chronologisch sortieren (älteste zuerst)
-    $events = $events | Sort-Object TimeCreated
+    # Chronologisch sortieren (älteste zuerst)
+    $eventsSorted = $events | Sort-Object TimeCreated
 
-    Write-Host ""
+    # [NEU #1] Executive Summary ZUERST berechnen und anzeigen
+    $summary = Get-ExecutiveSummary -Events $eventsSorted
+    Show-ExecutiveSummary -Summary $summary
+
+    # ── Event-Liste ────────────────────────────────────────────────────────────
+
     Write-Host ("{0,-6}{1,-20} {2,-6} {3,-22} {4}" -f "", "Zeitstempel", "ID", "Typ", "Details") -ForegroundColor Gray
     Write-Host ("-" * 90) -ForegroundColor DarkGray
 
     $flagCount = 0
 
-    foreach ($event in $events) {
+    # [NEU #3] IDs aller 2003-Events vorsammeln – für Korrelationsblöcke
+    $disable2003Events = $eventsSorted | Where-Object { $_.Id -eq 2003 }
+    $shownCorrelationBlocks = [System.Collections.Generic.HashSet[string]]::new()
+
+    foreach ($event in $eventsSorted) {
         try {
             $eventXml  = [xml]$event.ToXml()
             $timestamp = $event.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')
             $id        = $event.Id
 
+            # [NEU #4] Rauschunterdrückung: Noise-Events ausblenden
+            if ($ShowOnlySuspicious -and $id -in $NOISE_EVENT_IDS) { continue }
+
             switch ($id) {
 
                 # ── Dienst-Status ──────────────────────────────────────────
                 5000 {
+                    # Nur anzeigen wenn $ShowOnlySuspicious = $false (sonst oben bereits gefiltert)
                     Write-Row -Time $timestamp -EventID $id -Type "Defender GESTARTET" -Message "Dienst aktiviert" -Color Green
                 }
                 5001 {
                     Write-Row -Time $timestamp -EventID $id -Type "Defender GESTOPPT" -Message "Dienst deaktiviert!" -Color Red
                 }
 
-                # ── Echtzeitschutz ─────────────────────────────────────────
-                { $_ -in @(5004, 2003, 5010, 5012) } {
-                    $desc = switch ($id) {
-                        5004  { "Echtzeitschutz-Konfiguration geändert" }
-                        2003  { "Echtzeitschutz DEAKTIVIERT" }
-                        5010  { "Scan deaktiviert" }
-                        5012  { "Defender-Komponente deaktiviert" }
+                # ── Echtzeitschutz deaktiviert (2003) – SMOKING GUN ────────
+                # [NEU #3] Korrelationsblock: Schutz AUS → Aktionen → Schutz AN
+                2003 {
+                    $tMin = $event.TimeCreated.AddMinutes(-$CorrelationWindowMinutes)
+                    $tMax = $event.TimeCreated.AddMinutes($CorrelationWindowMinutes)
+
+                    # Kritische Events im Zeitfenster suchen
+                    $correlated = $eventsSorted | Where-Object {
+                        $_.TimeCreated -ge $tMin -and
+                        $_.TimeCreated -le $tMax -and
+                        $_.Id -ne 2003 -and
+                        $_.Id -in @(1006,1007,1008,1009,1015,1116,1117,1118,1119,5007,5004)
                     }
-                    $color = if ($id -eq 2003) { 'DarkRed' } else { 'DarkYellow' }
-                    Write-Row -Time $timestamp -EventID $id -Type "Schutz-Änderung" -Message $desc -Color $color
+
+                    # [NEU #6] Visueller Block – Schutz-Deaktivierungsphase
+                    Write-Host ""
+                    Write-Host ("  " + "▓" * 76) -ForegroundColor DarkRed
+                    Write-Host ("  ▓▓  KRITISCH: ECHTZEITSCHUTZ DEAKTIVIERT [ID 2003]") -ForegroundColor Red
+                    Write-Host ("  ▓▓  Zeitpunkt: $timestamp") -ForegroundColor Red
+                    if ($correlated) {
+                        Write-Host ("  ▓▓  ⚠  $($correlated.Count) kritische Event(s) im ±${CorrelationWindowMinutes}-Minuten-Fenster!") -ForegroundColor Yellow
+                    } else {
+                        Write-Host ("  ▓▓  Keine korrelierten Aktionen im Zeitfenster gefunden.") -ForegroundColor DarkYellow
+                    }
+                    Write-Host ("  " + "▓" * 76) -ForegroundColor DarkRed
+                    Write-Host ""
+
+                    # Korrelierte Events anzeigen
+                    if ($correlated) {
+                        Write-Host ("  ┌── AKTIONEN IM DEAKTIVIERUNGSFENSTER (±${CorrelationWindowMinutes} Min) ──────────────────────────") -ForegroundColor DarkRed
+
+                        # Nächstes 2003-Ende suchen (wann wurde Schutz wieder aktiviert?)
+                        $nextActive = $eventsSorted | Where-Object {
+                            $_.Id -in @(5000, 5004) -and $_.TimeCreated -gt $event.TimeCreated
+                        } | Select-Object -First 1
+                        if ($nextActive) {
+                            $offDuration = [int]($nextActive.TimeCreated - $event.TimeCreated).TotalMinutes
+                            Write-Host ("  │  Schutz wieder aktiv: $($nextActive.TimeCreated.ToString('HH:mm:ss')) (nach ca. ${offDuration} Minuten)") -ForegroundColor DarkYellow
+                            Write-Host ("  │") -ForegroundColor DarkRed
+                        }
+
+                        foreach ($ce in $correlated | Sort-Object TimeCreated) {
+                            try {
+                                $ceXml      = [xml]$ce.ToXml()
+                                $ceTime     = $ce.TimeCreated.ToString('HH:mm:ss')
+                                $ceThreat   = Get-XmlData -Xml $ceXml -FieldName 'Threat Name'
+                                $cePath     = Extract-ThreatPath -RawPath (Get-XmlData -Xml $ceXml -FieldName 'Path')
+                                $ceAction   = Get-XmlData -Xml $ceXml -FieldName 'Action Name'
+                                $ceNewVal   = Get-XmlData -Xml $ceXml -FieldName 'New Value'
+                                $ceSeverity = Get-XmlData -Xml $ceXml -FieldName 'Severity Name'
+
+                                $ceDetail = "ID=$($ce.Id)"
+                                if ($ceThreat)   { $ceDetail += " | Threat: $ceThreat" }
+                                if ($ceSeverity)  { $ceDetail += " [$ceSeverity]" }
+                                if ($ceAction)   { $ceDetail += " → $ceAction" }
+                                if ($cePath)     { $ceDetail += " | $cePath" }
+                                if ($ceNewVal -and $ceNewVal -match 'Exclusions\\') {
+                                    $ceDetail += " | EXCLUSION: $ceNewVal"
+                                }
+
+                                $ceMatch = Get-CheatMatch -Text "$ceThreat $cePath $ceNewVal"
+                                $ceColor = if ($ceMatch) { 'Yellow' } else { 'Gray' }
+                                Write-Host ("  │  $ceTime  $ceDetail") -ForegroundColor $ceColor
+                                if ($ceMatch) {
+                                    Write-Host ("  │  >>> CHEAT-KEYWORD MATCH: `"$ceMatch`" <<<") -ForegroundColor Yellow
+                                }
+                            } catch {}
+                        }
+
+                        Write-Host ("  └────────────────────────────────────────────────────────────────────────────") -ForegroundColor DarkRed
+                    }
+                    Write-Host ""
+                    $flagCount++
                 }
+
+                # ── Weitere Schutz-Deaktivierungen ────────────────────────
+                { $_ -in @(5004, 5010, 5012) } {
+                    if ($ShowOnlySuspicious) { continue }
+                    $desc = switch ($id) {
+                        5004 { "Echtzeitschutz-Konfiguration geändert" }
+                        5010 { "Scan deaktiviert" }
+                        5012 { "Defender-Komponente deaktiviert" }
+                    }
+                    Write-Row -Time $timestamp -EventID $id -Type "Schutz-Änderung" -Message $desc -Color DarkYellow
+                }
+
+                # ── Signatur-Updates (2004) – nur mit Pfad-Bezug zeigen ────
+                # [NEU #4] 2004 ohne erkennbaren Pfad/Exclusion-Bezug = Rauschen, ausblenden
                 2004 {
                     $detail = Get-XmlData -Xml $eventXml -FieldName 'New Value'
-                    if (-not $detail) { $detail = "Konfigurationsänderung" }
+                    if ($ShowOnlySuspicious -and ($detail -notmatch 'Exclusions\\' -and $detail -notmatch '\\')) { continue }
                     Write-Row -Time $timestamp -EventID $id -Type "Echtzeitschutz" -Message $detail -Color DarkYellow
                 }
 
-                # ── Konfiguration / Exclusions ─────────────────────────────
-                # Nur Exclusion-Änderungen anzeigen – interne Windows-Konfig-
-                # Änderungen (Diagnostics, Definitions, Updates, Signatures usw.)
-                # werden komplett ignoriert, da sie keinen Informationswert haben.
+                # ── Konfiguration / Exclusions (5007) ─────────────────────
                 5007 {
                     $newVal = Get-XmlData -Xml $eventXml -FieldName 'New Value'
                     $oldVal = Get-XmlData -Xml $eventXml -FieldName 'Old Value'
 
-                    # Nur Events mit Exclusions-Bezug weiterverarbeiten
                     $isExclusionEvent = ($newVal -match 'Exclusions\\' -or $oldVal -match 'Exclusions\\')
                     if (-not $isExclusionEvent) { continue }
 
@@ -278,10 +499,11 @@ function Get-DefenderEvents {
                                 elseif ($parsedOld -and -not $parsedNew) { "ENTFERNT" }
                                 else                                      { "GEÄNDERT" }
 
-                    $msg = "${changeOp}: $value"
-                    $isFlagged = Test-CheatMatch -Text "$parsedNew $parsedOld"
+                    $msg       = "${changeOp}: $value"
+                    $kwMatch   = Get-CheatMatch -Text "$parsedNew $parsedOld"
+                    $isFlagged = $null -ne $kwMatch
                     if ($isFlagged) { $flagCount++ }
-                    Write-Row -Time $timestamp -EventID $id -Type $exType -Message $msg -Color Red -Flagged:$isFlagged
+                    Write-Row -Time $timestamp -EventID $id -Type $exType -Message $msg -Color Red -Flagged:$isFlagged -MatchKeyword:$kwMatch
                 }
 
                 # ── Threat-Erkennung ───────────────────────────────────────
@@ -295,11 +517,12 @@ function Get-DefenderEvents {
                     $msg = ""
                     if ($threatName) { $msg += "[$threatName] " }
                     if ($severity)   { $msg += "Schwere: $severity | " }
-                    if ($cleanPath)  { $msg += $cleanPath } else { $msg += "(kein Pfad)" }
+                    $msg += if ($cleanPath) { $cleanPath } else { "(kein Pfad)" }
 
-                    $isFlagged = Test-CheatMatch -Text "$cleanPath $threatName"
+                    $kwMatch   = Get-CheatMatch -Text "$cleanPath $threatName"
+                    $isFlagged = $null -ne $kwMatch
                     if ($isFlagged) { $flagCount++ }
-                    Write-Row -Time $timestamp -EventID $id -Type "THREAT ERKANNT" -Message $msg -Color DarkRed -Flagged:$isFlagged
+                    Write-Row -Time $timestamp -EventID $id -Type "THREAT ERKANNT" -Message $msg -Color DarkRed -Flagged:$isFlagged -MatchKeyword:$kwMatch
                 }
 
                 # ── Threat-Aktion ──────────────────────────────────────────
@@ -313,11 +536,12 @@ function Get-DefenderEvents {
                     $msg = ""
                     if ($action)     { $msg += "Aktion: $action | " }
                     if ($threatName) { $msg += "[$threatName] " }
-                    if ($cleanPath)  { $msg += $cleanPath } else { $msg += "(kein Pfad)" }
+                    $msg += if ($cleanPath) { $cleanPath } else { "(kein Pfad)" }
 
-                    $isFlagged = Test-CheatMatch -Text "$cleanPath $threatName"
+                    $kwMatch   = Get-CheatMatch -Text "$cleanPath $threatName"
+                    $isFlagged = $null -ne $kwMatch
                     if ($isFlagged) { $flagCount++ }
-                    Write-Row -Time $timestamp -EventID $id -Type "Threat-Aktion" -Message $msg -Color Red -Flagged:$isFlagged
+                    Write-Row -Time $timestamp -EventID $id -Type "Threat-Aktion" -Message $msg -Color Red -Flagged:$isFlagged -MatchKeyword:$kwMatch
                 }
 
                 # ── Bereinigung fehlgeschlagen ─────────────────────────────
@@ -329,9 +553,10 @@ function Get-DefenderEvents {
                     if ($threatName) { $msg += "[$threatName] " }
                     $msg += if ($cleanPath) { $cleanPath } else { "(kein Pfad)" }
 
-                    $isFlagged = Test-CheatMatch -Text "$cleanPath $threatName"
+                    $kwMatch   = Get-CheatMatch -Text "$cleanPath $threatName"
+                    $isFlagged = $null -ne $kwMatch
                     if ($isFlagged) { $flagCount++ }
-                    Write-Row -Time $timestamp -EventID $id -Type "Berein. FEHLER" -Message $msg -Color DarkRed -Flagged:$isFlagged
+                    Write-Row -Time $timestamp -EventID $id -Type "Berein. FEHLER" -Message $msg -Color DarkRed -Flagged:$isFlagged -MatchKeyword:$kwMatch
                 }
 
                 # ── Bereinigung erfolgreich ────────────────────────────────
@@ -342,12 +567,14 @@ function Get-DefenderEvents {
                     $msg = ""
                     if ($threatName) { $msg += "[$threatName] " }
                     $msg += if ($cleanPath) { $cleanPath } else { "(kein Pfad)" }
-                    $isFlagged = Test-CheatMatch -Text "$cleanPath $threatName"
+
+                    $kwMatch   = Get-CheatMatch -Text "$cleanPath $threatName"
+                    $isFlagged = $null -ne $kwMatch
                     if ($isFlagged) { $flagCount++ }
-                    Write-Row -Time $timestamp -EventID $id -Type "Berein. OK" -Message $msg -Color DarkGreen -Flagged:$isFlagged
+                    Write-Row -Time $timestamp -EventID $id -Type "Berein. OK" -Message $msg -Color DarkGreen -Flagged:$isFlagged -MatchKeyword:$kwMatch
                 }
 
-                # ── Quarantäne WIEDERHERGESTELLT (sehr verdächtig!) ────────
+                # ── Quarantäne WIEDERHERGESTELLT ──────────────────────────
                 1009 {
                     $rawPath    = Get-XmlData -Xml $eventXml -FieldName 'Path'
                     $threatName = Get-XmlData -Xml $eventXml -FieldName 'Threat Name'
@@ -355,22 +582,21 @@ function Get-DefenderEvents {
                     $msg = "AUS QUARANTÄNE WIEDERHERGESTELLT | "
                     if ($threatName) { $msg += "[$threatName] " }
                     $msg += if ($cleanPath) { $cleanPath } else { "(kein Pfad)" }
-                    $isFlagged = Test-CheatMatch -Text "$cleanPath $threatName"
-                    if ($isFlagged) { $flagCount++ }
-                    # Immer als flagged markieren – Quarantäne-Restore ist extrem verdächtig
-                    Write-Row -Time $timestamp -EventID $id -Type "QUARANT. RESTORE" -Message $msg -Color Yellow -Flagged
+
+                    $kwMatch   = Get-CheatMatch -Text "$cleanPath $threatName"
+                    # Quarantäne-Restore ist IMMER verdächtig – Keyword-Match optional
+                    Write-Row -Time $timestamp -EventID $id -Type "QUARANT. RESTORE" -Message $msg -Color Yellow -Flagged -MatchKeyword:$kwMatch
                     $flagCount++
                 }
 
-                # ── Verlauf gelöscht (1013) – nur anzeigen wenn Threats im Zeitfenster ──
+                # ── Verlauf gelöscht (1013) – nur wenn Threats in der Nähe ──
                 1013 {
                     $tMin   = $event.TimeCreated.AddMinutes(-5)
                     $tMax   = $event.TimeCreated.AddMinutes(5)
-                    $nearby = $events | Where-Object {
+                    $nearby = $eventsSorted | Where-Object {
                         $_.TimeCreated -ge $tMin -and $_.TimeCreated -le $tMax -and
                         $_.Id -in @(1006,1007,1008,1009,1015,1116,1117,1118,1119)
                     }
-                    # Kein Threat in der Nähe = kein Informationswert, überspringen
                     if (-not $nearby) { continue }
 
                     $flagCount++
@@ -378,6 +604,7 @@ function Get-DefenderEvents {
                     Write-Host ("  " + "─" * 76) -ForegroundColor DarkRed
                     Write-Host ("  [!!!] $timestamp  [1013]  SCHUTZVERLAUF-EINTRAG GELÖSCHT") -ForegroundColor Red
                     Write-Host ("        Threats im Zeitfenster ±5 Min:") -ForegroundColor Cyan
+
                     foreach ($nb in $nearby | Sort-Object TimeCreated) {
                         try {
                             $nbXml      = [xml]$nb.ToXml()
@@ -393,17 +620,17 @@ function Get-DefenderEvents {
                             if ($nbAction)   { $detail += " → $nbAction" }
                             if ($nbPath)     { $detail += " | $nbPath" }
 
-                            $isSusp = Test-CheatMatch -Text "$nbThreat $nbPath"
-                            $col    = if ($isSusp) { 'Yellow' } else { 'Gray' }
+                            $nbMatch = Get-CheatMatch -Text "$nbThreat $nbPath"
+                            $col     = if ($nbMatch) { 'Yellow' } else { 'Gray' }
                             Write-Host ("          $nbTime  $detail") -ForegroundColor $col
-                            if ($isSusp) { Write-Host ("          >>> CHEAT-KEYWORD MATCH <<<") -ForegroundColor Yellow }
+                            if ($nbMatch) {
+                                Write-Host ("          >>> CHEAT-KEYWORD MATCH: `"$nbMatch`" <<<") -ForegroundColor Yellow
+                            }
                         } catch {}
                     }
                     Write-Host ("  " + "─" * 76) -ForegroundColor DarkRed
                     Write-Host ""
                 }
-
-                # Alle anderen Event-IDs werden bewusst ignoriert (kein Informationswert)
             }
         }
         catch {
@@ -417,14 +644,13 @@ function Get-DefenderEvents {
     if ($flagCount -gt 0) {
         Write-Host "  [!!!] VERDÄCHTIGE Events    : $flagCount" -ForegroundColor Yellow
         Write-Host "        Hinweis: Geflaggte Einträge deuten auf mögliche Cheat-Aktivität hin!" -ForegroundColor Yellow
-    }
-    else {
+    } else {
         Write-Host "  Keine verdächtigen Einträge gefunden." -ForegroundColor Green
     }
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AKTUELLE EXCLUSIONS AUSLESEN (Registry – zeigt auch manuell eingetragene!)
+# AKTUELLE EXCLUSIONS AUSLESEN (Registry)
 # ─────────────────────────────────────────────────────────────────────────────
 
 function Show-CurrentExclusions {
@@ -442,18 +668,18 @@ function Show-CurrentExclusions {
         try {
             $regPath = $exclusionTypes[$exType]
             if (Test-Path $regPath) {
-                $values = Get-ItemProperty -Path $regPath -ErrorAction Stop
+                $values  = Get-ItemProperty -Path $regPath -ErrorAction Stop
                 $entries = $values.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' }
                 if ($entries) {
                     Write-Host ""
                     Write-Host "  [$exType]" -ForegroundColor Cyan
                     foreach ($entry in $entries) {
-                        $isSusp = Test-CheatMatch -Text $entry.Name
-                        $color  = if ($isSusp) { 'Yellow' } else { 'White' }
-                        $prefix = if ($isSusp) { "  [!!!] " } else { "        " }
+                        $kwMatch = Get-CheatMatch -Text $entry.Name
+                        $color   = if ($kwMatch) { 'Yellow' } else { 'White' }
+                        $prefix  = if ($kwMatch) { "  [!!!] " } else { "        " }
                         Write-Host "${prefix}$($entry.Name)" -ForegroundColor $color
-                        if ($isSusp) {
-                            Write-Host "         >>> VERDÄCHTIG: Möglicher Cheat-Pfad <<<" -ForegroundColor Yellow
+                        if ($kwMatch) {
+                            Write-Host "         >>> VERDÄCHTIG: Möglicher Cheat-Pfad | Match: `"$kwMatch`"" -ForegroundColor Yellow
                         }
                     }
                     $anyFound = $true
@@ -477,7 +703,6 @@ function Show-CurrentExclusions {
 function Show-Quarantine {
     Write-Header "QUARANTÄNE-EINTRÄGE"
 
-    # MpCmdRun -Restore -ListAll gibt lesbare Einträge mit Name, Pfad und Datum
     $mpCmd = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
     if (-not (Test-Path $mpCmd)) { $mpCmd = "$env:ProgramFiles (x86)\Windows Defender\MpCmdRun.exe" }
 
@@ -487,7 +712,6 @@ function Show-Quarantine {
     }
 
     try {
-        # -Restore -ListAll listet alle in Quarantäne befindlichen Bedrohungen
         $lines = & $mpCmd -Restore -ListAll 2>&1 | Where-Object { $_ -match '\S' }
     }
     catch {
@@ -495,8 +719,10 @@ function Show-Quarantine {
         return
     }
 
-    # MpCmdRun gibt "No items" oder leere Ausgabe wenn Quarantäne leer
-    $meaningful = $lines | Where-Object { $_ -notmatch '^\s*$' -and $_ -notmatch 'CmdTool' -and $_ -notmatch 'Copyright' -and $_ -notmatch '^\-+$' }
+    $meaningful = $lines | Where-Object {
+        $_ -notmatch '^\s*$' -and $_ -notmatch 'CmdTool' -and
+        $_ -notmatch 'Copyright' -and $_ -notmatch '^\-+$'
+    }
 
     if (-not $meaningful -or ($meaningful -join '') -match 'No items|keine Elemente') {
         Write-Host "  Quarantäne ist leer." -ForegroundColor Green
@@ -505,30 +731,32 @@ function Show-Quarantine {
 
     Write-Host ""
     foreach ($line in $meaningful) {
-        $isSusp = Test-CheatMatch -Text $line
-        $color  = if ($isSusp) { 'Yellow' } else { 'Gray' }
-        $prefix = if ($isSusp) { "  [!!!] " } else { "        " }
+        $kwMatch = Get-CheatMatch -Text $line
+        $color   = if ($kwMatch) { 'Yellow' } else { 'Gray' }
+        $prefix  = if ($kwMatch) { "  [!!!] " } else { "        " }
         Write-Host "${prefix}$line" -ForegroundColor $color
-        if ($isSusp) { Write-Host "         >>> CHEAT-KEYWORD MATCH <<<" -ForegroundColor Yellow }
+        if ($kwMatch) {
+            Write-Host "         >>> CHEAT-KEYWORD MATCH: `"$kwMatch`" <<<" -ForegroundColor Yellow
+        }
     }
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SYSTEM-EVENTLOG: Wurde Defender-Log geleert? (Event 104)
+# LOG-LÖSCHUNGS-PRÜFUNG (Event 104)
 # ─────────────────────────────────────────────────────────────────────────────
 
 function Check-LogCleared {
     Write-Header "LOG-LÖSCHUNGS-PRÜFUNG (System-Eventlog)"
 
     try {
+        # [NEU #2] FilterHashtable direkt – kein Zwischenspeichern aller Events
         $clearEvents = Get-WinEvent -FilterHashtable @{LogName='System'; Id=104} -ErrorAction Stop
         if ($clearEvents) {
             Write-Host "  [!!!] WARNUNG: Das Ereignisprotokoll wurde $($clearEvents.Count)x geleert!" -ForegroundColor Red
             foreach ($e in $clearEvents | Sort-Object TimeCreated) {
                 Write-Host "        $($e.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss')) - $($e.Message.Split("`n")[0])" -ForegroundColor DarkRed
             }
-        }
-        else {
+        } else {
             Write-Host "  Kein Hinweis auf manuelles Löschen des Eventlogs." -ForegroundColor Green
         }
     }
@@ -541,7 +769,7 @@ function Check-LogCleared {
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Admin-Check am Anfang
+# Admin-Check
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
     Write-Host "  [WARNUNG] Script läuft NICHT als Administrator!" -ForegroundColor Red
